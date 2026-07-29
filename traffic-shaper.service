@@ -1,0 +1,8 @@
+[Unit]
+Description=Adaptive traffic shaper (monthly bandwidth budget)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/traffic-shaper.sh
