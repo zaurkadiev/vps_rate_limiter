@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Adaptive tc rate limiter driven by monthly vnstat usage.
+# tc rate limiter driven by a self-adjusting daily quota: 95% of the
+# month's remaining budget spread over the month's remaining days (an
+# envelope-budgeting pacer — a light day leaves more for the days after
+# it, a heavy day leaves less). Rate follows a downward parabola
+# (Y = MAX_MBIT - k*X^2, X = % of today's quota used) that reaches
+# EMERGENCY_MBIT exactly at EMERGENCY_THRESHOLD_PCT and stays there for
+# the rest of the day.
 # See README.md for how this works and what each variable means.
 set -euo pipefail
 
 IFACE="${IFACE:-ens3}"
 BUDGET_GIB="${BUDGET_GIB:-1024}"
-MARGIN_PCT="${MARGIN_PCT:-5}"
 MIN_MBIT="${MIN_MBIT:-5}"
-MAX_MBIT="${MAX_MBIT:-1000}"
+MAX_MBIT="${MAX_MBIT:-500}"
 OVERRIDE_FILE="${OVERRIDE_FILE:-/etc/traffic-shaper-force-floor}"
+EMERGENCY_THRESHOLD_PCT="${EMERGENCY_THRESHOLD_PCT:-85}"
+EMERGENCY_MBIT="${EMERGENCY_MBIT:-3}"
 
 # ── One-time topology setup (idempotent: safe to re-run every 5 min) ──
 ip link show ifb0 &>/dev/null || { modprobe ifb numifbs=1; ip link add ifb0 type ifb; }
@@ -21,42 +28,57 @@ tc filter show dev "$IFACE" parent ffff: | grep -q "ifb0" || \
   tc filter add dev "$IFACE" parent ffff: protocol all u32 match u32 0 0 \
     action mirred egress redirect dev ifb0
 
-# ── This month's usage (bytes) from vnstat, for the rate calc and the log line ──
-used=$(vnstat --json m -i "$IFACE" | jq -r '.interfaces[0].traffic.month[-1] | .rx+.tx')
+# ── Usage (bytes) from vnstat: today's, for the rate calc and the log ──
+# ── line, and this month's, to derive today's quota below.            ──
+used=$(vnstat --json d -i "$IFACE" | jq -r '.interfaces[0].traffic.day[-1] | .rx+.tx')
+used_month=$(vnstat --json m -i "$IFACE" | jq -r '.interfaces[0].traffic.month[-1] | .rx+.tx')
 
-if [[ -f "$OVERRIDE_FILE" && "$(cat "$OVERRIDE_FILE")" == "$(date +%Y-%m)" ]]; then
-  # Forced floor for the rest of this calendar month (auto-expires when the
-  # file's YYYY-MM stops matching, i.e. at the next month rollover).
-  rate_mbit="$MIN_MBIT"
-  burst_kbit=$(( MIN_MBIT * 50 ))
-else
-  # ── Target rate = remaining budget / remaining time in calendar month ──
-  read -r rate_mbit burst_kbit <<<"$(python3 - "$used" "$BUDGET_GIB" "$MARGIN_PCT" "$MIN_MBIT" "$MAX_MBIT" <<'PYEOF'
-import sys, datetime
+# ── Quota: 95% of (BUDGET_GIB - usage through yesterday) / days left    ──
+# ── in the calendar month (today counts as a remaining day). Parabola: ──
+# ── Y = MAX_MBIT - k*X^2, X = % of that quota used today, k chosen so  ──
+# ── Y(EMERGENCY_THRESHOLD_PCT)=EMERGENCY_MBIT.                         ──
+read -r rate_mbit burst_kbit daily_quota_gib <<<"$(python3 - "$used" "$used_month" "$BUDGET_GIB" "$MAX_MBIT" "$EMERGENCY_THRESHOLD_PCT" "$EMERGENCY_MBIT" <<'PYEOF'
+import calendar
+import datetime
+import sys
 
 used = int(sys.argv[1])
-budget_gib = float(sys.argv[2])
-margin_pct = float(sys.argv[3])
-min_mbit = float(sys.argv[4])
-max_mbit = float(sys.argv[5])
+used_month = int(sys.argv[2])
+budget_gib = float(sys.argv[3])
+max_mbit = float(sys.argv[4])
+emergency_threshold_pct = float(sys.argv[5])
+emergency_mbit = float(sys.argv[6])
 
-budget = budget_gib * (1 - margin_pct / 100) * 1024**3
+today = datetime.date.today()
+days_in_month = calendar.monthrange(today.year, today.month)[1]
+remaining_days = days_in_month - today.day + 1
 
-now = datetime.datetime.now()
-if now.month == 12:
-    next_month = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-else:
-    next_month = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
-remaining_seconds = max((next_month - now).total_seconds(), 1)
-remaining_bytes = max(budget - used, 0)
+used_through_yesterday = used_month - used
+remaining_gib = budget_gib - used_through_yesterday / 1024**3
 
-target_mbit = (remaining_bytes * 8 / remaining_seconds) / 1_000_000
-rate_mbit = min(max(target_mbit, min_mbit), max_mbit)
+daily_quota_gib = 0.95 * max(remaining_gib, 0) / remaining_days
+daily_quota = daily_quota_gib * 1024**3
+
+# Non-positive quota means the monthly budget is already spent: force
+# the emergency floor via a huge pct_used rather than defaulting to 0,
+# which would read as "no usage yet" and give full MAX_MBIT speed.
+pct_used = (used / daily_quota * 100) if daily_quota > 0 else 1e9
+
+k = (max_mbit - emergency_mbit) / (emergency_threshold_pct ** 2)
+rate_mbit = max(max_mbit - k * pct_used ** 2, emergency_mbit)
+
 burst_kbit = max(32, int(rate_mbit * 50))  # ~50ms worth of data at the target rate
 
-print(f"{rate_mbit:.2f} {burst_kbit}")
+print(f"{rate_mbit:.2f} {burst_kbit} {daily_quota_gib:.2f}")
 PYEOF
 )"
+
+if [[ -f "$OVERRIDE_FILE" && "$(cat "$OVERRIDE_FILE")" == "$(date +%Y-%m-%d)" ]]; then
+  # Forced floor for the rest of today (auto-expires when the file's
+  # YYYY-MM-DD stops matching, i.e. at midnight). Overrides the computed
+  # rate above; daily_quota_gib is still logged below for visibility.
+  rate_mbit="$MIN_MBIT"
+  burst_kbit=$(( MIN_MBIT * 50 ))
 fi
 
 # ── Apply (idempotent upsert) ──
@@ -64,4 +86,4 @@ tc qdisc replace dev "$IFACE" root tbf rate "${rate_mbit}mbit" burst "${burst_kb
 tc qdisc replace dev ifb0 root tbf rate "${rate_mbit}mbit" burst "${burst_kbit}kbit" latency 50ms
 
 used_mib=$((used / 1048576))
-echo "traffic-shaper: used=${used_mib}MiB budget=${BUDGET_GIB}GiB margin=${MARGIN_PCT}% rate=${rate_mbit}mbit"
+echo "traffic-shaper: used_today=${used_mib}MiB daily_quota=${daily_quota_gib}GiB rate=${rate_mbit}mbit"
