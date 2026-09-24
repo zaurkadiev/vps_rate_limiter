@@ -18,7 +18,9 @@ EMERGENCY_THRESHOLD_PCT="${EMERGENCY_THRESHOLD_PCT:-85}"
 EMERGENCY_MBIT="${EMERGENCY_MBIT:-3}"
 
 # ── One-time topology setup (idempotent: safe to re-run every 5 min) ──
-ip link show ifb0 &>/dev/null || { modprobe ifb numifbs=1; ip link add ifb0 type ifb; }
+# modprobe with numifbs=1 already creates ifb0 on first load; only add it if not.
+ip link show ifb0 &>/dev/null || modprobe ifb numifbs=1
+ip link show ifb0 &>/dev/null || ip link add ifb0 type ifb
 ip link set ifb0 up
 
 tc qdisc show dev "$IFACE" | grep -q "ingress" || \
