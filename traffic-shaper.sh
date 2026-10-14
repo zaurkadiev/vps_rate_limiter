@@ -26,13 +26,15 @@ ip link show ifb0 &>/dev/null || modprobe ifb numifbs=1
 ip link show ifb0 &>/dev/null || ip link add ifb0 type ifb
 ip link set ifb0 up
 
-tc qdisc show dev "$IFACE" | grep -q "ingress" || \
+# (grep -q on a here-string, not a pipe: with pipefail, grep exiting early can
+# SIGPIPE tc and make a present match look absent.)
+grep -q "ingress" <<<"$(tc qdisc show dev "$IFACE")" || \
   tc qdisc add dev "$IFACE" handle ffff: ingress
 
 # connmark restores the video mark onto ingress packets before the redirect,
 # so the htb filter on ifb0 can classify them. Old filters (no connmark) are
 # replaced.
-tc filter show dev "$IFACE" parent ffff: | grep -q connmark || {
+grep -q connmark <<<"$(tc filter show dev "$IFACE" parent ffff:)" || {
   tc filter del dev "$IFACE" parent ffff: 2>/dev/null || true
   tc filter add dev "$IFACE" parent ffff: protocol all u32 match u32 0 0 \
     action connmark pipe action mirred egress redirect dev ifb0
@@ -114,7 +116,7 @@ video_mbit=$(awk -v a="$VIDEO_LIMIT_MBIT" -v b="$rate_mbit" 'BEGIN{print (a<b ? 
 
 apply_htb() {
   local dev=$1
-  tc qdisc show dev "$dev" | grep -q "htb 1:" || \
+  grep -q "htb 1:" <<<"$(tc qdisc show dev "$dev")" || \
     tc qdisc replace dev "$dev" root handle 1: htb default 20
   tc class replace dev "$dev" parent 1:  classid 1:1  htb rate "${rate_mbit}mbit" ceil "${rate_mbit}mbit" burst "${burst_kbit}kbit"
   tc class replace dev "$dev" parent 1:1 classid 1:10 htb rate 1mbit ceil "${video_mbit}mbit" burst "${burst_kbit}kbit"
