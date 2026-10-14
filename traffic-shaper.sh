@@ -16,6 +16,9 @@ MAX_MBIT="${MAX_MBIT:-500}"
 OVERRIDE_FILE="${OVERRIDE_FILE:-/etc/traffic-shaper-force-floor}"
 EMERGENCY_THRESHOLD_PCT="${EMERGENCY_THRESHOLD_PCT:-85}"
 EMERGENCY_MBIT="${EMERGENCY_MBIT:-3}"
+VIDEO_LIMIT_MBIT="${VIDEO_LIMIT_MBIT:-10}"
+VIDEO_HOSTS="${VIDEO_HOSTS:-googlevideo.com nflxvideo.net ttvnw.net tiktokcdn.com fbcdn.net}"
+VIDEO_MARK=0x10
 
 # ── One-time topology setup (idempotent: safe to re-run every 5 min) ──
 # modprobe with numifbs=1 already creates ifb0 on first load; only add it if not.
@@ -26,9 +29,31 @@ ip link set ifb0 up
 tc qdisc show dev "$IFACE" | grep -q "ingress" || \
   tc qdisc add dev "$IFACE" handle ffff: ingress
 
-tc filter show dev "$IFACE" parent ffff: | grep -q "ifb0" || \
+# connmark restores the video mark onto ingress packets before the redirect,
+# so the htb filter on ifb0 can classify them. Old filters (no connmark) are
+# replaced.
+tc filter show dev "$IFACE" parent ffff: | grep -q connmark || {
+  tc filter del dev "$IFACE" parent ffff: 2>/dev/null || true
   tc filter add dev "$IFACE" parent ffff: protocol all u32 match u32 0 0 \
-    action mirred egress redirect dev ifb0
+    action connmark pipe action mirred egress redirect dev ifb0
+}
+
+# ── Video detection: mark connections whose TLS ClientHello carries a    ──
+# ── VIDEO_HOSTS name in its SNI; the mark is saved on the connection so  ──
+# ── later packets (egress here, ingress via act_connmark) inherit it.    ──
+# ponytail: SNI over TCP/443 only (QUIC/UDP video is not matched), and
+# --save-mark overwrites any other connmark on these flows.
+iptables -t mangle -N TS_VIDEO 2>/dev/null || iptables -t mangle -F TS_VIDEO
+iptables -t mangle -A TS_VIDEO -j CONNMARK --restore-mark
+for h in $VIDEO_HOSTS; do
+  iptables -t mangle -A TS_VIDEO -p tcp --dport 443 -m mark --mark 0 \
+    -m string --algo bm --string "$h" -j MARK --set-mark "$VIDEO_MARK"
+done
+iptables -t mangle -A TS_VIDEO -j CONNMARK --save-mark
+for chain in OUTPUT FORWARD; do
+  iptables -t mangle -C "$chain" -j TS_VIDEO 2>/dev/null || \
+    iptables -t mangle -A "$chain" -j TS_VIDEO
+done
 
 # ── Usage (bytes) from vnstat: today's, for the rate calc and the log ──
 # ── line, and this month's, to derive today's quota below.            ──
@@ -83,9 +108,21 @@ if [[ -f "$OVERRIDE_FILE" && "$(cat "$OVERRIDE_FILE")" == "$(date +%Y-%m-%d)" ]]
   burst_kbit=$(( MIN_MBIT * 50 ))
 fi
 
-# ── Apply (idempotent upsert) ──
-tc qdisc replace dev "$IFACE" root tbf rate "${rate_mbit}mbit" burst "${burst_kbit}kbit" latency 50ms
-tc qdisc replace dev ifb0 root tbf rate "${rate_mbit}mbit" burst "${burst_kbit}kbit" latency 50ms
+# ── Apply (idempotent upsert): htb 1:1 = adaptive total, split into ──
+# ── 1:10 video (hard-capped) and 1:20 everything else.              ──
+video_mbit=$(awk -v a="$VIDEO_LIMIT_MBIT" -v b="$rate_mbit" 'BEGIN{print (a<b ? a : b)}')
+
+apply_htb() {
+  local dev=$1
+  tc qdisc show dev "$dev" | grep -q "htb 1:" || \
+    tc qdisc replace dev "$dev" root handle 1: htb default 20
+  tc class replace dev "$dev" parent 1:  classid 1:1  htb rate "${rate_mbit}mbit" ceil "${rate_mbit}mbit" burst "${burst_kbit}kbit"
+  tc class replace dev "$dev" parent 1:1 classid 1:10 htb rate 1mbit ceil "${video_mbit}mbit" burst "${burst_kbit}kbit"
+  tc class replace dev "$dev" parent 1:1 classid 1:20 htb rate "${rate_mbit}mbit" ceil "${rate_mbit}mbit" burst "${burst_kbit}kbit"
+  tc filter replace dev "$dev" parent 1: protocol all prio 1 handle "$VIDEO_MARK" fw flowid 1:10
+}
+apply_htb "$IFACE"
+apply_htb ifb0
 
 used_mib=$((used / 1048576))
-echo "traffic-shaper: used_today=${used_mib}MiB daily_quota=${daily_quota_gib}GiB rate=${rate_mbit}mbit"
+echo "traffic-shaper: used_today=${used_mib}MiB daily_quota=${daily_quota_gib}GiB rate=${rate_mbit}mbit video_cap=${video_mbit}mbit"

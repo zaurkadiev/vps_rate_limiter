@@ -39,15 +39,16 @@ step function would have.
 1. **Topology (set up once, kept idempotent so it's safe to re-check every
    run):**
    - Egress on the real interface (`IFACE`, e.g. `ens3`) is shaped directly
-     with a `tc tbf` (token bucket filter) qdisc — the simplest qdisc that
-     does a flat rate limit, since there's only one traffic class here (no
-     priorities needed).
+     with a `tc htb` qdisc: class `1:1` is the adaptive total, split into
+     `1:10` (video, hard-capped at `VIDEO_LIMIT_MBIT`) and `1:20` (all other
+     traffic). See **Video traffic limit**.
    - Ingress can't be shaped directly in Linux (`tc` only supports
      *policing*, i.e. dropping packets, on ingress — not smooth shaping).
      The standard workaround is used: an `ifb0` virtual interface is
      created, all ingress traffic on `IFACE` is mirrored/redirected to it
-     via `tc filter ... action mirred egress redirect dev ifb0`, and a
-     `tbf` qdisc shapes `ifb0` instead.
+     via `tc filter ... action mirred egress redirect dev ifb0` (after
+     `action connmark`, which restores the video mark), and the same `htb`
+     layout shapes `ifb0` instead.
 
 2. **Every 5 minutes** (systemd timer, matching vnstat's own poll
    interval — checking more often wouldn't see new data anyway):
@@ -72,8 +73,9 @@ step function would have.
      downward parabola pinned to `rate(0%) = MAX_MBIT` and
      `rate(EMERGENCY_THRESHOLD_PCT%) = EMERGENCY_MBIT`, clamped flat at the
      floor beyond that point.
-   - Apply the resulting rate to both the `IFACE` egress qdisc and the
-     `ifb0` ingress qdisc via `tc qdisc replace` (upsert — safe to run
+   - Apply the resulting rate to the `1:1`/`1:20` classes (and
+     `min(VIDEO_LIMIT_MBIT, rate)` to `1:10`) on both the `IFACE` egress and
+     `ifb0` ingress via `tc class replace` (upsert — safe to run
      repeatedly, no duplicate rules ever get created).
 
 Each new day's quota is recomputed from whatever budget and days actually
@@ -100,6 +102,41 @@ edit the deployed script for a lasting change).
 | `OVERRIDE_FILE` | `/etc/traffic-shaper-force-floor` | Path checked for the force-floor override, see below. |
 | `EMERGENCY_THRESHOLD_PCT` | `85` | The percentage of today's (dynamically computed) quota at which the parabola reaches `EMERGENCY_MBIT` exactly; the rate stays clamped at the floor for any usage beyond this point. |
 | `EMERGENCY_MBIT` | `3` | Rate in Mbps at and beyond `EMERGENCY_THRESHOLD_PCT` — the parabola's floor. |
+| `VIDEO_LIMIT_MBIT` | `10` | Strict cap in Mbps for video traffic only (both directions). Always clamped to the current adaptive rate, so video never exceeds either limit. See **Video traffic limit**. |
+| `VIDEO_HOSTS` | `googlevideo.com nflxvideo.net ttvnw.net tiktokcdn.com fbcdn.net` | Space-separated hostname substrings matched against the TLS SNI to classify a connection as video. |
+
+## Video traffic limit
+
+Video is capped separately from everything else: a connection whose TLS
+ClientHello (TCP/443) contains a `VIDEO_HOSTS` name is marked via iptables
+(`mangle` chain `TS_VIDEO`), and the mark is kept on the connection so its
+packets in both directions land in a dedicated `htb` class (`1:10`) with
+`ceil = min(VIDEO_LIMIT_MBIT, adaptive rate)`. Everything else uses class
+`1:20`; both share the adaptive total (`1:1`).
+
+To change the limit or the host list, edit the two `VIDEO_*` lines at the top
+of `/usr/local/bin/traffic-shaper.sh` (see **Manually updating the deployed
+script**), e.g.:
+
+```bash
+VIDEO_LIMIT_MBIT="${VIDEO_LIMIT_MBIT:-5}"
+VIDEO_HOSTS="${VIDEO_HOSTS:-googlevideo.com nflxvideo.net example-video.com}"
+```
+
+Check that it works (bytes should grow on class `1:10` while a video plays):
+
+```bash
+tc -s class show dev ens3                # egress classes
+tc -s class show dev ifb0                # ingress classes
+iptables -t mangle -L TS_VIDEO -v -n     # per-host match counters
+```
+
+Limitations: only SNI on TCP/443 is matched, so QUIC/HTTP3 (UDP/443) video
+is not caught — block it so clients fall back to TCP
+(`iptables -A OUTPUT -p udp --dport 443 -j REJECT`, and the same on
+`FORWARD` if the box routes traffic). A hostname shared with non-video
+traffic on the same CDN gets limited too. The rule sets a connection mark,
+so it overwrites any other connmark on port-443 flows.
 
 ## Force floor now
 
@@ -145,8 +182,9 @@ This installs `traffic-shaper.sh` to `/usr/local/bin/`, the systemd unit +
 timer to `/etc/systemd/system/`, enables and starts the timer, and runs the
 script once immediately so shaping is active without waiting 5 minutes.
 
-Requires `vnstat`, `tc` (iproute2), `jq`, and `python3` to already be
-installed and `vnstat` to already be tracking `IFACE` (it does this
+Requires `vnstat`, `tc` (iproute2), `iptables` (with the `xt_string` and
+conntrack modules; `act_connmark` for tc), `jq`, `awk`, and `python3` to
+already be installed and `vnstat` to already be tracking `IFACE` (it does this
 automatically for any interface it sees traffic on — check with
 `vnstat --iflist`).
 
@@ -214,6 +252,9 @@ plays out — it is not a fixed fraction of `BUDGET_GIB` anymore.
 systemctl stop traffic-shaper.timer
 tc qdisc del dev ens3 root
 tc qdisc del dev ens3 ingress
+iptables -t mangle -D OUTPUT -j TS_VIDEO
+iptables -t mangle -D FORWARD -j TS_VIDEO
+iptables -t mangle -F TS_VIDEO && iptables -t mangle -X TS_VIDEO
 
 # re-enable
 systemctl start traffic-shaper.timer   # next tick re-creates everything

@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-for bin in vnstat tc jq python3; do
+for bin in vnstat tc jq python3 iptables awk; do
   command -v "$bin" &>/dev/null || { echo "Missing dependency: $bin" >&2; exit 1; }
 done
 
