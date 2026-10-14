@@ -16,8 +16,9 @@ MAX_MBIT="${MAX_MBIT:-500}"
 OVERRIDE_FILE="${OVERRIDE_FILE:-/etc/traffic-shaper-force-floor}"
 EMERGENCY_THRESHOLD_PCT="${EMERGENCY_THRESHOLD_PCT:-85}"
 EMERGENCY_MBIT="${EMERGENCY_MBIT:-3}"
-VIDEO_LIMIT_MBIT="${VIDEO_LIMIT_MBIT:-10}"
+VIDEO_LIMIT_MBIT="${VIDEO_LIMIT_MBIT:-3}"
 VIDEO_HOSTS="${VIDEO_HOSTS:-googlevideo.com nflxvideo.net ttvnw.net tiktokcdn.com fbcdn.net}"
+BLOCK_QUIC="${BLOCK_QUIC:-1}"
 VIDEO_MARK=0x10
 
 # ── One-time topology setup (idempotent: safe to re-run every 5 min) ──
@@ -43,7 +44,7 @@ grep -q connmark <<<"$(tc filter show dev "$IFACE" parent ffff:)" || {
 # ── Video detection: mark connections whose TLS ClientHello carries a    ──
 # ── VIDEO_HOSTS name in its SNI; the mark is saved on the connection so  ──
 # ── later packets (egress here, ingress via act_connmark) inherit it.    ──
-# ponytail: SNI over TCP/443 only (QUIC/UDP video is not matched), and
+# ponytail: SNI over TCP/443 only (QUIC is handled by BLOCK_QUIC below), and
 # --save-mark overwrites any other connmark on these flows.
 iptables -t mangle -N TS_VIDEO 2>/dev/null || iptables -t mangle -F TS_VIDEO
 iptables -t mangle -A TS_VIDEO -j CONNMARK --restore-mark
@@ -56,6 +57,21 @@ for chain in OUTPUT FORWARD; do
   iptables -t mangle -C "$chain" -j TS_VIDEO 2>/dev/null || \
     iptables -t mangle -A "$chain" -j TS_VIDEO
 done
+
+# ── QUIC (UDP/443) hides the SNI, so reject it and clients fall back to ──
+# ── TCP, where the video match above works. BLOCK_QUIC=0 removes this.   ──
+if [[ "$BLOCK_QUIC" == 1 ]]; then
+  iptables -N TS_QUIC 2>/dev/null || iptables -F TS_QUIC
+  iptables -A TS_QUIC -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+  for chain in FORWARD OUTPUT; do
+    iptables -C "$chain" -j TS_QUIC 2>/dev/null || iptables -I "$chain" 1 -j TS_QUIC
+  done
+else
+  for chain in FORWARD OUTPUT; do
+    iptables -D "$chain" -j TS_QUIC 2>/dev/null || true
+  done
+  iptables -F TS_QUIC 2>/dev/null && iptables -X TS_QUIC 2>/dev/null || true
+fi
 
 # ── Usage (bytes) from vnstat: today's, for the rate calc and the log ──
 # ── line, and this month's, to derive today's quota below.            ──

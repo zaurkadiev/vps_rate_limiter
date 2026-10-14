@@ -102,8 +102,9 @@ edit the deployed script for a lasting change).
 | `OVERRIDE_FILE` | `/etc/traffic-shaper-force-floor` | Path checked for the force-floor override, see below. |
 | `EMERGENCY_THRESHOLD_PCT` | `85` | The percentage of today's (dynamically computed) quota at which the parabola reaches `EMERGENCY_MBIT` exactly; the rate stays clamped at the floor for any usage beyond this point. |
 | `EMERGENCY_MBIT` | `3` | Rate in Mbps at and beyond `EMERGENCY_THRESHOLD_PCT` — the parabola's floor. |
-| `VIDEO_LIMIT_MBIT` | `10` | Strict cap in Mbps for video traffic only (both directions). Always clamped to the current adaptive rate, so video never exceeds either limit. See **Video traffic limit**. |
+| `VIDEO_LIMIT_MBIT` | `3` | Strict cap in Mbps for video traffic only (both directions). Always clamped to the current adaptive rate, so video never exceeds either limit. See **Video traffic limit**. |
 | `VIDEO_HOSTS` | `googlevideo.com nflxvideo.net ttvnw.net tiktokcdn.com fbcdn.net` | Space-separated hostname substrings matched against the TLS SNI to classify a connection as video. |
+| `BLOCK_QUIC` | `1` | `1` rejects UDP/443 (QUIC/HTTP3) in `FORWARD` and `OUTPUT` so clients fall back to TCP, where the video match works; `0` removes the rule. Without it most YouTube video bypasses the video limit. |
 
 ## Video traffic limit
 
@@ -131,12 +132,15 @@ tc -s class show dev ifb0                # ingress classes
 iptables -t mangle -L TS_VIDEO -v -n     # per-host match counters
 ```
 
-Limitations: only SNI on TCP/443 is matched, so QUIC/HTTP3 (UDP/443) video
-is not caught — block it so clients fall back to TCP
-(`iptables -A OUTPUT -p udp --dport 443 -j REJECT`, and the same on
-`FORWARD` if the box routes traffic). A hostname shared with non-video
-traffic on the same CDN gets limited too. The rule sets a connection mark,
-so it overwrites any other connmark on port-443 flows.
+QUIC/HTTP3 (UDP/443) hides the hostname, so with `BLOCK_QUIC=1` (default)
+the script rejects UDP/443 from VPN clients and from the box itself
+(chain `TS_QUIC` in the `filter` table); browsers and apps then fall back to
+TCP. This affects all QUIC, not only video. Set `BLOCK_QUIC=0` to keep QUIC,
+at the cost of QUIC video escaping the limit.
+
+Limitations: only SNI on TCP/443 is matched, a hostname shared with
+non-video traffic on the same CDN gets limited too, and the marking
+overwrites any other connmark on port-443 flows.
 
 ## Force floor now
 
@@ -255,6 +259,8 @@ tc qdisc del dev ens3 ingress
 iptables -t mangle -D OUTPUT -j TS_VIDEO
 iptables -t mangle -D FORWARD -j TS_VIDEO
 iptables -t mangle -F TS_VIDEO && iptables -t mangle -X TS_VIDEO
+iptables -D FORWARD -j TS_QUIC; iptables -D OUTPUT -j TS_QUIC
+iptables -F TS_QUIC && iptables -X TS_QUIC
 
 # re-enable
 systemctl start traffic-shaper.timer   # next tick re-creates everything
